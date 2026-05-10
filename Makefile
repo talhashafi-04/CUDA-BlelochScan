@@ -1,32 +1,34 @@
-# ─── cuda-prefix-sum-v2 Makefile ──────────────────────────────────────────────
+# ─── cuda-prefix-sum-v3 Makefile ──────────────────────────────────────────────
 #
 # GPU arch targets:
-#   sm_75  = Turing  (T4, RTX 2080)   ← Colab free tier
+#   sm_75  = Turing  (T4, RTX 2080)   ← Colab free tier  ← DEFAULT
 #   sm_80  = Ampere  (A100 40GB)      ← Colab Pro
 #   sm_86  = Ampere  (RTX 3090)
 #   sm_89  = Ada     (RTX 4090)
 #   sm_70  = Volta   (V100)
 #
 # Usage:
-#   make            # build for sm_75 (T4 default)
-#   make ARCH=sm_80 # build for A100
-#   make test       # correctness suite
-#   make benchmark  # full sweep → results_v2.csv
-#   make compare    # run all three algos at 16M
+#   make                  # build for sm_75 (T4)
+#   make ARCH=sm_80       # build for A100
+#   make test             # correctness suite (all 4 algos)
+#   make benchmark        # full sweep → results_v3.csv
+#   make compare          # all 4 algos at 16M, exclusive
+#   make compare_incl     # all 4 algos at 16M, inclusive
+#   make sizes            # sweep sizes with optimized only
 
 NVCC       ?= nvcc
 ARCH       ?= sm_75
-NVCCFLAGS   = -O3 -arch=$(ARCH) -std=c++17             \
-              --expt-relaxed-constexpr                  \
-              -Xcompiler -Wall,-Wextra                  \
-              --generate-line-info                      \
+NVCCFLAGS   = -O3 -arch=$(ARCH) -std=c++17            \
+              --expt-relaxed-constexpr                 \
+              -Xcompiler -Wall,-Wextra                 \
+              --generate-line-info                     \
               -DNDEBUG
 
-TARGET     = prefix_scan_v2
+TARGET     = prefix_scan_v3
 SRC        = src/main.cu src/scan.cu
 HDR        = src/scan.cuh
 
-.PHONY: all clean test run benchmark compare fat
+.PHONY: all clean test run benchmark compare compare_incl sizes fat
 
 all: $(TARGET)
 
@@ -37,20 +39,30 @@ test: $(TARGET)
 	./$(TARGET) --test
 
 run: $(TARGET)
-	./$(TARGET) --n 16777216 --repeats 10 --warmups 3
+	./$(TARGET) --n 16777216 --algo optimized --repeats 20 --warmups 5
 
 compare: $(TARGET)
-	@echo "=== Comparing all algorithms at n=16M, exclusive ==="
-	./$(TARGET) --n 16777216 --algo all --scan-type exclusive --repeats 10
+	@echo "=== All algorithms, n=16M, exclusive ==="
+	./$(TARGET) --n 16777216 --algo all --scan-type exclusive --repeats 20 --warmups 5
+
+compare_incl: $(TARGET)
+	@echo "=== All algorithms, n=16M, inclusive ==="
+	./$(TARGET) --n 16777216 --algo all --scan-type inclusive --repeats 20 --warmups 5
+
+sizes: $(TARGET)
+	@echo "=== Optimized: size sweep ==="
+	@for n in 10000 100000 1000000 10000000 100000000; do \
+	    echo "--- n=$$n ---"; \
+	    ./$(TARGET) --n $$n --algo optimized --repeats 20 --warmups 5; \
+	done
 
 benchmark: $(TARGET)
 	chmod +x scripts/run_benchmarks.sh
 	./scripts/run_benchmarks.sh
 
 clean:
-	rm -f $(TARGET) results_v2.csv
+	rm -f $(TARGET) results_v3.csv
 
-# Build fat binary for all common arches (useful for sharing)
 fat: $(SRC) $(HDR)
 	$(NVCC) -O3 -std=c++17 --expt-relaxed-constexpr  \
 	  -gencode arch=compute_70,code=sm_70             \
