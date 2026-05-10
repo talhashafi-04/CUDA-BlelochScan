@@ -1,127 +1,158 @@
 #!/usr/bin/env python3
-"""plot_results.py — generate speedup and throughput SVG charts from results.csv"""
+"""
+cuda-prefix-sum-v2 — plot_results.py
 
-import csv, sys, os, math
-from collections import defaultdict
+Reads results_v2.csv and produces comparison charts showing:
+  - Speedup (GPU vs CPU) for each algorithm across array sizes
+  - Throughput (GB/s) for each algorithm
+  - Speedup ratio: single_pass / blelloch  (how much better the fix is)
 
-def read_csv(path):
-    rows = []
-    with open(path) as f:
-        for row in csv.DictReader(f):
-            rows.append({
-                'n':            int(row['n']),
-                'scan_type':    row['scan_type'],
-                'cpu_ms':       float(row['cpu_median_ms']),
-                'gpu_ms':       float(row['gpu_median_ms']),
-                'speedup':      float(row['speedup']),
-                'throughput':   float(row['throughput_GBs']),
-                'status':       row['status'],
-            })
-    return rows
+Usage:
+    python3 scripts/plot_results.py [results_v2.csv]
+"""
 
-def svg_chart(title, xlabel, ylabel, series, outpath):
-    W, H = 720, 420
-    PAD = dict(top=40, right=30, bottom=60, left=70)
-    cw = W - PAD['left'] - PAD['right']
-    ch = H - PAD['top']  - PAD['bottom']
+import sys
+import csv
+import os
+import math
 
-    all_x = sorted({x for s in series for x,_ in s['points']})
-    all_y = [y for s in series for _,y in s['points']]
-    x_min, x_max = min(all_x), max(all_x)
-    y_min, y_max = 0, max(all_y) * 1.15
+# Try matplotlib; fall back to a text summary if not available
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.ticker as ticker
+    HAS_MPL = True
+except ImportError:
+    HAS_MPL = False
 
-    colors = ['#1D9E75','#3B8BD4','#D85A30','#BA7517']
+CSV_FILE = sys.argv[1] if len(sys.argv) > 1 else "results_v2.csv"
+OUT_DIR  = "charts"
+os.makedirs(OUT_DIR, exist_ok=True)
 
-    def px(x): return PAD['left'] + (math.log10(x) - math.log10(x_min)) / \
-                       (math.log10(x_max) - math.log10(x_min)) * cw
-    def py(y): return PAD['top'] + ch - (y / y_max) * ch
+# ─── load data ────────────────────────────────────────────────────────────────
+rows = []
+with open(CSV_FILE) as f:
+    for row in csv.DictReader(f):
+        rows.append({
+            "n":             int(row["n"]),
+            "scan_type":     row["scan_type"],
+            "algo":          row["algo"],
+            "cpu_ms":        float(row["cpu_median_ms"]),
+            "gpu_ms":        float(row["gpu_median_ms"]),
+            "speedup":       float(row["speedup"]),
+            "throughput":    float(row["throughput_GBs"]),
+            "ok":            row["status"] == "OK",
+        })
 
-    lines = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{W}" height="{H}" '
-             f'viewBox="0 0 {W} {H}">']
-    lines.append(f'<rect width="{W}" height="{H}" fill="#ffffff"/>')
-    lines.append(f'<text x="{W//2}" y="24" text-anchor="middle" '
-                 f'font-family="sans-serif" font-size="15" font-weight="500">{title}</text>')
+algos      = ["blelloch", "single_pass", "cub"]
+algo_label = {"blelloch": "Blelloch (v1 recursive)",
+              "single_pass": "Single-Pass Look-back (v2)",
+              "cub": "CUB::DeviceScan (reference)"}
+colors     = {"blelloch": "#e74c3c", "single_pass": "#2ecc71", "cub": "#3498db"}
+scan_types = ["exclusive", "inclusive"]
 
-    # axes
-    lines.append(f'<line x1="{PAD["left"]}" y1="{PAD["top"]}" '
-                 f'x2="{PAD["left"]}" y2="{PAD["top"]+ch}" stroke="#888" stroke-width="1"/>')
-    lines.append(f'<line x1="{PAD["left"]}" y1="{PAD["top"]+ch}" '
-                 f'x2="{PAD["left"]+cw}" y2="{PAD["top"]+ch}" stroke="#888" stroke-width="1"/>')
+def get(scan_type, algo, field):
+    pts = [(r["n"], r[field]) for r in rows
+           if r["scan_type"] == scan_type and r["algo"] == algo]
+    pts.sort()
+    return [p[0] for p in pts], [p[1] for p in pts]
 
-    # x ticks (log scale)
-    for x in all_x:
-        xi = px(x)
-        lbl = f'{x:,}' if x < 1_000_000 else f'{x//1_000_000}M' if x >= 1_000_000 else f'{x//1000}K'
-        lines.append(f'<line x1="{xi:.1f}" y1="{PAD["top"]+ch}" '
-                     f'x2="{xi:.1f}" y2="{PAD["top"]+ch+5}" stroke="#888" stroke-width="1"/>')
-        lines.append(f'<text x="{xi:.1f}" y="{PAD["top"]+ch+18}" text-anchor="middle" '
-                     f'font-family="sans-serif" font-size="11" fill="#555">{lbl}</text>')
+if not HAS_MPL:
+    # ─── text summary ─────────────────────────────────────────────────────────
+    print(f"\n{'n':>12}  {'algo':>15}  {'type':>10}  {'speedup':>8}  {'GB/s':>8}")
+    print("-" * 60)
+    for r in sorted(rows, key=lambda x: (x["scan_type"], x["algo"], x["n"])):
+        print(f"{r['n']:>12}  {r['algo']:>15}  {r['scan_type']:>10}  "
+              f"{r['speedup']:>8.3f}  {r['throughput']:>8.2f}")
+    sys.exit(0)
 
-    # y ticks
-    n_yticks = 5
-    for i in range(n_yticks + 1):
-        yv = y_max * i / n_yticks
-        yi = py(yv)
-        lines.append(f'<line x1="{PAD["left"]-4}" y1="{yi:.1f}" '
-                     f'x2="{PAD["left"]+cw}" y2="{yi:.1f}" stroke="#e0e0e0" stroke-width="0.5"/>')
-        lines.append(f'<text x="{PAD["left"]-8}" y="{yi+4:.1f}" text-anchor="end" '
-                     f'font-family="sans-serif" font-size="11" fill="#555">{yv:.1f}</text>')
+# ─── plotting ─────────────────────────────────────────────────────────────────
+STYLE = {
+    "font.family":     "monospace",
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid":       True,
+    "grid.alpha":      0.3,
+    "figure.dpi":      150,
+}
+plt.rcParams.update(STYLE)
 
-    # axis labels
-    lines.append(f'<text x="{PAD["left"]+cw//2}" y="{H-8}" text-anchor="middle" '
-                 f'font-family="sans-serif" font-size="12" fill="#333">{xlabel}</text>')
-    lines.append(f'<text x="14" y="{PAD["top"]+ch//2}" text-anchor="middle" '
-                 f'transform="rotate(-90,14,{PAD["top"]+ch//2})" '
-                 f'font-family="sans-serif" font-size="12" fill="#333">{ylabel}</text>')
+for st in scan_types:
+    # ── 1. Speedup comparison ──────────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for algo in algos:
+        xs, ys = get(st, algo, "speedup")
+        if xs:
+            ax.plot(xs, ys, "o-", color=colors[algo],
+                    label=algo_label[algo], linewidth=2, markersize=6)
 
-    # series
-    for si, s in enumerate(series):
-        col = colors[si % len(colors)]
-        pts = sorted(s['points'])
-        d = ' '.join(f'{"M" if i==0 else "L"}{px(x):.1f},{py(y):.1f}'
-                     for i,(x,y) in enumerate(pts))
-        lines.append(f'<path d="{d}" fill="none" stroke="{col}" stroke-width="2.5" '
-                     f'stroke-linejoin="round" stroke-linecap="round"/>')
-        for x,y in pts:
-            lines.append(f'<circle cx="{px(x):.1f}" cy="{py(y):.1f}" r="4" '
-                         f'fill="{col}" stroke="#fff" stroke-width="1.5"/>')
+    ax.axhline(1.0, color="grey", linestyle="--", linewidth=1, label="CPU baseline (1×)")
+    ax.set_xscale("log")
+    ax.set_xlabel("Array size (n)", fontsize=12)
+    ax.set_ylabel("Speedup  (CPU time / GPU time)", fontsize=12)
+    ax.set_title(f"GPU Speedup vs CPU — {st} scan\nBlelloch vs Single-Pass vs CUB", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+        lambda v, _: f"{int(v):,}" if v < 1e6 else f"{v/1e6:.0f}M"))
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, f"speedup_{st}.svg")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"Saved {path}")
 
-        # legend
-        lx = PAD['left'] + 12 + si * 140
-        ly = PAD['top'] + 10
-        lines.append(f'<rect x="{lx}" y="{ly}" width="12" height="12" fill="{col}" rx="2"/>')
-        lines.append(f'<text x="{lx+16}" y="{ly+10}" font-family="sans-serif" '
-                     f'font-size="11" fill="#333">{s["label"]}</text>')
+    # ── 2. Throughput comparison ───────────────────────────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    for algo in algos:
+        xs, ys = get(st, algo, "throughput")
+        if xs:
+            ax.plot(xs, ys, "s-", color=colors[algo],
+                    label=algo_label[algo], linewidth=2, markersize=6)
 
-    lines.append('</svg>')
-    os.makedirs(os.path.dirname(outpath) or '.', exist_ok=True)
-    with open(outpath, 'w') as f:
-        f.write('\n'.join(lines))
-    print(f'  wrote {outpath}')
+    ax.set_xscale("log")
+    ax.set_xlabel("Array size (n)", fontsize=12)
+    ax.set_ylabel("Throughput (GB/s)", fontsize=12)
+    ax.set_title(f"GPU Throughput — {st} scan\n(T4 peak memory bandwidth ≈ 320 GB/s)", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+        lambda v, _: f"{int(v):,}" if v < 1e6 else f"{v/1e6:.0f}M"))
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, f"throughput_{st}.svg")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"Saved {path}")
 
-def main():
-    path = sys.argv[1] if len(sys.argv) > 1 else 'results.csv'
-    rows = read_csv(path)
+    # ── 3. Improvement ratio: single_pass / blelloch ──────────────────────────
+    fig, ax = plt.subplots(figsize=(9, 5))
+    xb, yb = get(st, "blelloch",   "gpu_ms")
+    xs, ys = get(st, "single_pass","gpu_ms")
+    xc, yc = get(st, "cub",        "gpu_ms")
 
-    os.makedirs('charts', exist_ok=True)
+    # align on common n
+    nb = dict(zip(xb, yb))
+    ns = dict(zip(xs, ys))
+    nc = dict(zip(xc, yc))
+    ns_keys = sorted(set(nb) & set(ns) & set(nc))
 
-    for scan_type in ['exclusive', 'inclusive']:
-        sub = [r for r in rows if r['scan_type'] == scan_type and r['status'] == 'OK']
+    ratios_s = [nb[n] / ns[n] for n in ns_keys]
+    ratios_c = [nb[n] / nc[n] for n in ns_keys]
 
-        svg_chart(
-            title   = f'GPU speedup over CPU — {scan_type} scan',
-            xlabel  = 'Array size (n)',
-            ylabel  = 'Speedup (×)',
-            series  = [{'label': 'GPU / CPU', 'points': [(r['n'], r['speedup']) for r in sub]}],
-            outpath = f'charts/speedup_{scan_type}.svg',
-        )
-        svg_chart(
-            title   = f'GPU memory throughput — {scan_type} scan',
-            xlabel  = 'Array size (n)',
-            ylabel  = 'Throughput (GB/s)',
-            series  = [{'label': 'GPU throughput', 'points': [(r['n'], r['throughput']) for r in sub]}],
-            outpath = f'charts/throughput_{scan_type}.svg',
-        )
+    ax.plot(ns_keys, ratios_s, "o-", color=colors["single_pass"],
+            label="Single-Pass vs Blelloch", linewidth=2, markersize=7)
+    ax.plot(ns_keys, ratios_c, "^-", color=colors["cub"],
+            label="CUB vs Blelloch", linewidth=2, markersize=7)
+    ax.axhline(1.0, color="grey", linestyle="--", linewidth=1)
+    ax.set_xscale("log")
+    ax.set_xlabel("Array size (n)", fontsize=12)
+    ax.set_ylabel("Speedup ratio vs Blelloch (v1)", fontsize=12)
+    ax.set_title(f"How much faster is v2 than v1? — {st} scan", fontsize=13)
+    ax.legend(fontsize=10)
+    ax.xaxis.set_major_formatter(ticker.FuncFormatter(
+        lambda v, _: f"{int(v):,}" if v < 1e6 else f"{v/1e6:.0f}M"))
+    fig.tight_layout()
+    path = os.path.join(OUT_DIR, f"improvement_{st}.svg")
+    fig.savefig(path)
+    plt.close(fig)
+    print(f"Saved {path}")
 
-if __name__ == '__main__':
-    main()
+print("\nAll charts written to", OUT_DIR)

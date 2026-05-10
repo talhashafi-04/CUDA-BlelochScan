@@ -1,6 +1,6 @@
-prefix_scan
-prefix_scan_fat
-results.csv
+prefix_scan_v2
+prefix_scan_v2_fat
+results_v2.csv
 charts/*.svg
 *.o
-*.d
+*.a

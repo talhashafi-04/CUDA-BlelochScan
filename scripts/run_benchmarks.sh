@@ -1,37 +1,45 @@
 #!/usr/bin/env bash
-# run_benchmarks.sh — sweep sizes × scan types, emit results.csv
+# cuda-prefix-sum-v2  —  run_benchmarks.sh
+#
+# Runs all three algorithms over a range of array sizes and scan types.
+# Output: results_v2.csv
+#
+# Usage:
+#   chmod +x scripts/run_benchmarks.sh
+#   ./scripts/run_benchmarks.sh
 
-set -euo pipefail
+set -e
+BINARY="./prefix_scan_v2"
+OUT="results_v2.csv"
+REPEATS=10
+WARMUPS=3
 
-BINARY="${BINARY:-./prefix_scan}"
-SIZES="${SIZES:-10000 100000 1000000 10000000 100000000}"
-REPEATS="${REPEATS:-10}"
-WARMUPS="${WARMUPS:-3}"
-OUT="${OUT:-results.csv}"
-
-if [[ ! -x "$BINARY" ]]; then
-    echo "Binary $BINARY not found. Run 'make' first." >&2
+if [ ! -f "$BINARY" ]; then
+    echo "Binary $BINARY not found. Run 'make' first."
     exit 1
 fi
 
-echo "n,scan_type,cpu_median_ms,gpu_median_ms,speedup,throughput_GBs,status" > "$OUT"
+# Write CSV header
+echo "n,scan_type,algo,cpu_median_ms,gpu_median_ms,speedup,throughput_GBs,status" > "$OUT"
 
-for scan_type in exclusive inclusive; do
-    for n in $SIZES; do
-        echo -n "  n=$n  scan_type=$scan_type  ... "
-        # --csv prints header + row; we strip the header with tail -n +2
-        "$BINARY" \
-            --n "$n" \
-            --repeats "$REPEATS" \
-            --warmups "$WARMUPS" \
-            --scan-type "$scan_type" \
-            --csv \
-        | tail -n +2 >> "$OUT"
-        echo "done"
+SIZES=(10000 100000 1000000 10000000 100000000)
+TYPES=(exclusive inclusive)
+ALGOS=(blelloch single cub)
+
+total=$(( ${#SIZES[@]} * ${#TYPES[@]} * ${#ALGOS[@]} ))
+done=0
+
+for size in "${SIZES[@]}"; do
+    for type in "${TYPES[@]}"; do
+        for algo in "${ALGOS[@]}"; do
+            done=$((done + 1))
+            echo -ne "\r[$done/$total] n=$size type=$type algo=$algo     "
+            $BINARY --n "$size" --scan-type "$type" --algo "$algo" \
+                    --repeats "$REPEATS" --warmups "$WARMUPS" --csv \
+                | tail -n 1 >> "$OUT"
+        done
     done
 done
 
 echo ""
-echo "Results written to $OUT"
-echo ""
-column -t -s, "$OUT" 2>/dev/null || cat "$OUT"
+echo "Done. Results written to $OUT"

@@ -1,205 +1,167 @@
-# cuda-prefix-sum
+# cuda-prefix-sum-v2
 
-Highly optimised GPU parallel prefix scan (Blelloch 1990) implemented in CUDA C++.
-
-Companion to the OpenMP CPU implementation — demonstrates why the Blelloch
-tree algorithm is a natural fit for GPU hardware where thread synchronisation
-within a block is essentially free (`__syncthreads()`), unlike shared-memory
-CPUs where each OpenMP barrier carries significant latency.
+**Highly optimised GPU prefix scan — single-pass decoupled look-back.**  
+Research implementation based on Blelloch (1990) + Merrill & Garland (2016).
 
 ---
 
-## Optimisations
+## Why v1 Was Slow — The Diagnosis
 
-| Technique | Where | Effect |
+v1 used **host-side recursion** between kernel launches:
+
+```
+launch kernel (scan each block)        ← GPU kernel 1
+CPU: cudaMalloc block sums             ← HOST ROUND-TRIP  ~1.3 ms overhead
+launch kernel (scan block sums)        ← GPU kernel 2
+CPU: cudaMalloc again...               ← another round-trip
+launch kernel (add offsets)            ← GPU kernel 3
+... repeat log(n) times
+```
+
+For n = 100M: log₂(100M/2048) ≈ 16 → **~20 ms just in host overhead**.  
+The T4 peak bandwidth is 320 GB/s.  
+100M × 4 bytes = 400 MB → **theoretical minimum: 1.25 ms**.  
+v1 measured: 207 ms. The extra 206 ms is pure overhead.
+
+---
+
+## The Fix — Decoupled Look-Back (Merrill & Garland, 2016)
+
+**Paper:** "Single-pass Parallel Prefix Scan with Decoupled Look-back"  
+This is the algorithm used inside **NVIDIA CUB** and **Thrust** today.
+
+### Algorithm per tile (GPU thread block):
+
+```
+1. Compute LOCAL prefix sum (Blelloch in shared memory, bank-conflict free)
+2. Publish LOCAL AGGREGATE to global status array → mark PARTIAL
+3. LOOK-BACK: scan predecessor tiles' status entries (in device memory):
+     - Found STATUS_PREFIX tile? → add its value and STOP
+     - Found STATUS_PARTIAL tile? → accumulate and keep looking
+4. Once own prefix is known → add to all local elements
+5. Publish own INCLUSIVE PREFIX → mark PREFIX (so successors can proceed)
+```
+
+**Result:**  
+- **ONE kernel launch** for ANY array size  
+- **Zero host round-trips** between levels  
+- Tiles communicate through device memory — no CPU involvement  
+- O(1) amortised look-back per element
+
+### Optimisations on top of Blelloch:
+
+| Optimisation | Description | Benefit |
 |---|---|---|
-| Shared-memory Blelloch scan | `blelloch_block_scan_kernel` | Eliminates global-memory traffic per tree level |
-| Bank-conflict-free indexing | `CONFLICT_FREE_OFFSET` macro | Removes 32-way shared-mem bank conflicts |
-| Two elements per thread | Kernel loads/stores | Full warp utilisation at every tree level |
-| Multi-level block-sum recursion | `recursive_gpu_scan` | Handles arbitrary n, not just one block |
-| Coalesced global loads/stores | All kernels | Maximises memory bus utilisation |
-| CUDA streams + async alloc | `gpu_scan` | Overlaps host↔device transfers with compute |
-| Fused inclusive conversion | `exclusive_to_inclusive_kernel` | Avoids a separate global-memory pass |
-| CUDA event timing | `main.cu` | Accurate GPU-side timing, not host chrono |
+| Single-pass | One kernel launch, no host recursion | Eliminates ~1.3 ms × log(n) overhead |
+| Warp shuffles | `__shfl_up_sync` for intra-warp scan | No smem bank conflicts for first 5 levels |
+| 8 items/thread | Each thread processes ITEMS_PT=8 items | Better arithmetic intensity, fewer __syncthreads |
+| `__ldg()` loads | Read-only cache hint for input array | L2 cache reuse on repeated benchmark runs |
+| Persistent workspace | Status/counter arrays allocated once, reused | No per-call cudaMalloc latency |
+| Fused inclusive | Inclusive result computed inside same kernel | No second pass / extra kernel launch |
 
 ---
 
-## Requirements
+## Three Algorithms Compared
 
-- CUDA toolkit ≥ 11.0
-- GPU with compute capability ≥ 7.5 (default target: `sm_75` = T4 / RTX 2080)
-- GCC / Clang with C++17 support
-
----
-
-## Build
-
-```bash
-make            # default: sm_75 (Colab T4)
-make ARCH=sm_80 # for A100
-make fat        # multi-arch fat binary
-```
+| Algorithm | Kernel launches (n=100M) | Expected speedup vs CPU |
+|---|---|---|
+| `blelloch` (v1) | ~16 launches + host mallocs | 0.4× (slower than CPU!) |
+| `single_pass` (v2) | **1 launch** | 10–30× |
+| `cub` (reference) | 1 launch (production CUB) | 15–40× (ceiling) |
 
 ---
 
-## Run
+## Quick Start on Colab (T4)
 
-```bash
-# correctness suite
-make test
+### Step 1 — Get a T4 GPU
+`Runtime → Change runtime type → T4 GPU`
 
-# single benchmark (16 M elements, exclusive scan)
-make run
-
-# full sweep → results.csv → SVG charts
-make benchmark
-python3 scripts/plot_results.py results.csv
-```
-
-### CLI options
-
-```
---n <N>             Input size (default: 2^24 = 16 777 216)
---repeats <R>       Timed repetitions (default: 10)
---warmups <W>       Warm-up runs     (default: 3)
---scan-type <S>     exclusive | inclusive
---csv               Single CSV output row
---test              Correctness suite
-```
-
----
-
-## Running on Google Colab (T4 GPU)
-
-### 1. Clone and build
-
-Open a new Colab notebook, set runtime to **GPU → T4**, then run:
-
+### Step 2 — Clone and build
 ```python
-# Cell 1 — clone
-!git clone https://github.com/YOUR_USERNAME/cuda-prefix-sum.git
-%cd cuda-prefix-sum
+!git clone https://github.com/YOUR_USERNAME/cuda-prefix-sum-v2.git
+%cd cuda-prefix-sum-v2
+!make ARCH=sm_75    # T4 is sm_75
 ```
 
+### Step 3 — Correctness check
 ```python
-# Cell 2 — verify GPU
-!nvidia-smi
+!./prefix_scan_v2 --test
 ```
+Expected: `Correctness: PASS (N checks, 0 failures)`
 
+### Step 4 — Compare all algorithms at 16M elements
 ```python
-# Cell 3 — build (T4 is sm_75)
-!make ARCH=sm_75
+!./prefix_scan_v2 --algo all --n 16777216 --scan-type exclusive
 ```
 
-### 2. Correctness check
-
+### Step 5 — Full benchmark sweep
 ```python
-# Cell 4
-!./prefix_scan --test
-```
-
-Expected output:
-```
-GPU: Tesla T4  SMs=40  VRAM=15109 MB  peak_bw=320.1 GB/s
-Correctness: PASS (16 checks)
-```
-
-### 3. Single benchmark run
-
-```python
-# Cell 5
-!./prefix_scan --n 16777216 --repeats 10 --scan-type exclusive
-```
-
-Expected output on T4:
-```
-GPU: Tesla T4 ...
-Scan type       : exclusive
-Input size      : 16777216 elements
-Repeats/warmups : 10 / 3
-
-CPU median (ms) : 45.2000
-GPU median (ms) : 0.8300
-Speedup         : 54.5x
-Throughput      : 241.3 GB/s
-Correctness     : PASS
-```
-
-### 4. Full benchmark sweep
-
-```python
-# Cell 6
 !chmod +x scripts/run_benchmarks.sh
 !./scripts/run_benchmarks.sh
 ```
 
+### Step 6 — Plot results
 ```python
-# Cell 7 — plot
-!python3 scripts/plot_results.py results.csv
-```
+!pip install matplotlib -q
+!python3 scripts/plot_results.py results_v2.csv
 
-```python
-# Cell 8 — display charts inline
 from IPython.display import SVG, display
 display(SVG('charts/speedup_exclusive.svg'))
 display(SVG('charts/throughput_exclusive.svg'))
-display(SVG('charts/speedup_inclusive.svg'))
-display(SVG('charts/throughput_inclusive.svg'))
-```
-
-### 5. Profile with Nsight (optional)
-
-```python
-# Cell 9 — Nsight Systems timeline (requires Colab Pro or local)
-!ncu --metrics sm__throughput.avg.pct_of_peak_sustained_elapsed,\
-l1tex__t_bytes_pipe_lsu_mem_global_op_ld.sum,\
-l1tex__t_bytes_pipe_lsu_mem_global_op_st.sum \
-./prefix_scan --n 16777216 --repeats 1 --warmups 0
+display(SVG('charts/improvement_exclusive.svg'))
 ```
 
 ---
 
-## Expected results on T4
+## Expected Results on T4
 
-| n | CPU (ms) | GPU (ms) | Speedup | Throughput |
+| n | Blelloch (v1) | Single-Pass (v2) | CUB | v2 improvement |
 |---|---|---|---|---|
-| 10,000 | 0.03 | 0.08 | 0.4× | 1.5 GB/s |
-| 100,000 | 0.25 | 0.09 | 2.8× | 13.4 GB/s |
-| 1,000,000 | 2.5 | 0.18 | 13.9× | 66.7 GB/s |
-| 10,000,000 | 25.0 | 0.72 | 34.7× | 166.7 GB/s |
-| 100,000,000 | 250.0 | 6.8 | 36.8× | 176.5 GB/s |
-
-Small arrays show sub-1× speedup — kernel launch overhead dominates.  
-Large arrays approach ~55% of T4's theoretical 320 GB/s peak bandwidth,
-consistent with the roofline bound for a memory-bound kernel.
+| 10K | ~1.3 ms (0.003×) | ~0.05 ms | ~0.05 ms | **26×** |
+| 100K | ~1.4 ms (0.04×) | ~0.08 ms | ~0.07 ms | **18×** |
+| 1M | ~3.3 ms (0.2×) | ~0.3 ms | ~0.25 ms | **11×** |
+| 10M | ~22 ms (0.5×) | ~1.5 ms (7×) | ~1.2 ms | **15×** |
+| 100M | ~207 ms (0.4×) | ~8 ms (10×) | ~6 ms | **26×** |
 
 ---
 
-## Theoretical connection (Blelloch 1990)
+## Research Context
 
-The PRAM complexity is `O(n/p + lg p)`. On a GPU:
-- `p` = number of CUDA threads ≈ 40 SMs × 2048 threads = 81,920 threads
-- Each `__syncthreads()` costs ~20 cycles (vs ~50,000 cycles for an OpenMP barrier)
-- The tree has `2 × lg(BLOCK_SIZE)` = 20 sync levels per block
-- Total sync cost ≈ 20 × 20 cycles = 400 cycles vs OpenMP's 46 × 50,000 = 2,300,000 cycles
+### Theoretical basis (Blelloch 1990)
+- Optimal parallel scan: O(n/p + log p) on PRAM
+- PRAM assumes **zero communication cost** (barriers are free)
+- Real hardware: each barrier costs ~100 µs on CPU (OpenMP), ~1.3 ms host round-trip on GPU (naive CUDA)
 
-This is why the direct Blelloch tree scan is fast on GPU and slow on CPU.
+### Gap analysis
+```
+v1 gap:  kernel launch overhead dominates → O(log n) × 1.3 ms
+v2 fix:  decoupled look-back → O(1) launches → gap reduced to memory bandwidth
+CUB gap: remaining overhead vs peak bandwidth (pipeline latency, address generation)
+```
+
+### Why this matters
+Both our OpenMP (v0) and v1 CUDA implementations were slower than sequential.  
+Both confirm the same thesis: **the PRAM zero-cost synchronization assumption
+fails in real hardware** — on CPU via barrier latency, on GPU via kernel launch overhead.
+
+The single-pass algorithm (v2) eliminates the GPU-specific bottleneck by
+keeping all inter-tile communication on the device. This is why production
+libraries (CUB, Thrust, rocPRIM) all use this approach.
 
 ---
 
-## Project structure
+## File Structure
 
 ```
-cuda-prefix-sum/
+cuda-prefix-sum-v2/
 ├── src/
-│   ├── scan.cuh      Public API + CUDA_CHECK macro
-│   ├── scan.cu       All kernels + recursive scan logic
-│   └── main.cu       CLI, benchmark harness, correctness tests
+│   ├── scan.cuh    ← API header, three Algorithm variants
+│   ├── scan.cu     ← All implementations (Blelloch, SinglePass, CUB)
+│   └── main.cu     ← CLI harness, benchmarking, correctness tests
 ├── scripts/
-│   ├── run_benchmarks.sh
-│   └── plot_results.py
-├── charts/           Generated SVG charts
+│   ├── run_benchmarks.sh   ← Full sweep → results_v2.csv
+│   └── plot_results.py     ← Comparison charts
+├── charts/             ← Output SVGs (after running plot_results.py)
 ├── Makefile
 └── README.md
 ```
-# CUDA-BlelochScan
