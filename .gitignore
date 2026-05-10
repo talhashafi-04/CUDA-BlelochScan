@@ -1,0 +1,6 @@
+prefix_scan
+prefix_scan_fat
+results.csv
+charts/*.svg
+*.o
+*.d
