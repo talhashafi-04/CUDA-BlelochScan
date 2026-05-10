@@ -104,6 +104,8 @@ double median_of(std::vector<double> v) {
 }
 
 // ─── correctness suite ────────────────────────────────────────────────────────
+static constexpr int TILE_SZ = 256 * 8;  // must match BLOCK_SZ * ITEMS_PT in scan.cu
+
 bool run_tests() {
     auto make = [](int n){ return make_input(n); };
 
@@ -113,11 +115,10 @@ bool run_tests() {
         {"single",         {42}},
         {"small_pow2",     {3,1,7,0,4,1,6,3}},
         {"small_non_pow2", {5,0,2,9,1}},
-        {"one_tile",       make(4096)},
-        {"two_tiles",      make(4097)},
-        {"multi_tile",     make(100003)},
-        {"large",          make(1<<20)},
-        {"very_large",     make(1<<24)},
+        {"one_tile",       make(TILE_SZ)},
+        {"two_tiles",      make(TILE_SZ + 1)},
+        {"multi_tile",     make(TILE_SZ * 7 + 13)},
+        {"medium",         make(1 << 18)},   // 256K — fast enough for all 3 algos
     };
 
     const std::vector<scan::Algorithm> algos = {

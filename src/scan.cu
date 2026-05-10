@@ -1,173 +1,114 @@
 /*
- * cuda-prefix-sum-v2  —  scan.cu
+ * cuda-prefix-sum-v2  —  scan.cu  (fixed)
  *
- * ═══════════════════════════════════════════════════════════════════════════
- *  WHY v1 WAS SLOW — THE DIAGNOSIS
- * ═══════════════════════════════════════════════════════════════════════════
+ * Fixes vs previous version:
+ *  FIX 1 — tile_agg broadcast: __shfl_sync only works within a warp (32 threads).
+ *           For BLOCK_SZ=512, thread BLOCK_SZ-1 is in warp 15, not warp 0.
+ *           The correct broadcast uses shared memory, not __shfl_sync across warps.
  *
- *  The v1 Blelloch scan used HOST-SIDE RECURSION:
+ *  FIX 2 — look-back deadlock: if the GPU schedules tile N before tile N-1 has
+ *           published STATUS_PARTIAL, the spin loop waits forever.
+ *           Fix: use __threadfence() after writing tile_status so the store is
+ *           visible to other SMs before the spinning tile reads it.
  *
- *    launch kernel (scan each block)          ← kernel 1
- *    CPU: allocate, copy block sums           ← host round-trip (~1.3 ms)
- *    launch kernel (scan block sums)          ← kernel 2
- *    CPU: allocate again for level 3...       ← another round-trip
- *    launch kernel (add offsets)              ← kernel 3
- *    ...repeat for log(n) levels
- *
- *  For n = 100 M:  log₂(100M/2048) ≈ 16 levels  →  ~20 ms just in overhead.
- *  The T4 can move 320 GB/s. 100 M × 4 bytes = 400 MB → should take 1.25 ms.
- *  We measured 207 ms. The ratio is the overhead, not compute.
- *
- * ═══════════════════════════════════════════════════════════════════════════
- *  THE FIX — SINGLE-PASS DECOUPLED LOOK-BACK (Merrill & Garland, 2016)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- *  Key insight: blocks can communicate their results to downstream blocks
- *  THROUGH DEVICE MEMORY without ever returning to the CPU.
- *
- *  Algorithm per tile (block):
- *    1. Each tile computes its LOCAL prefix sum (Blelloch in shared memory).
- *    2. Tile writes its local aggregate to a global status array and marks
- *       status = PARTIAL.
- *    3. Tile spins (look-back) scanning earlier tiles' status entries:
- *       - If it finds a PREFIX-available tile, it adds that prefix and stops.
- *       - Otherwise it accumulates PARTIAL sums backward.
- *    4. Once prefix is known, tile adds it to its local output and marks
- *       its own status = PREFIX.
- *    5. Tile 0 always has prefix = 0 (no look-back needed).
- *
- *  Result: ONE kernel launch for ANY size array.
- *          No host round-trips between levels.
- *          O(n/p + p) device communication (amortised O(1) per element).
- *
- * ═══════════════════════════════════════════════════════════════════════════
- *  ADDITIONAL OPTIMISATIONS (on top of v1)
- * ═══════════════════════════════════════════════════════════════════════════
- *
- *  A. Vectorised loads  — __ldg() + int4 loads (4 elements per transaction)
- *     halves load instruction count, keeps L2 cache hotter.
- *
- *  B. Warp-level scan with __shfl_xor_sync() / __shfl_up_sync()
- *     — replaces the first 5 levels of shared-memory up/down-sweep with
- *     warp shuffles.  No shared memory bank conflicts, no __syncthreads()
- *     for intra-warp steps.
- *
- *  C. Persistent-grid tile counter with atomicAdd()
- *     — tiles claim work dynamically so slow tiles don't hold up fast ones.
- *     Natural load balancing across SMs.
- *
- *  D. All device-side state (status array, tile counter) allocated ONCE
- *     in the ScanWorkspace and reused across calls (no per-call cudaMalloc).
- *
- *  E. Zero-copy int4 loads for cache-line-aligned segments.
- *
- *  F. Inclusive scan: fused into the same kernel, no second pass.
+ *  FIX 3 — smem_items array was sized with padding slots but indexed without
+ *           them in the final store loop. Simplified: no padding (bank conflicts
+ *           are acceptable; correctness is the priority).
  */
 
 #include "scan.cuh"
-
-#include <cub/cub.cuh>       // for Algorithm::CUB reference
+#include <cub/cub.cuh>
 #include <cuda_runtime.h>
 #include <algorithm>
-#include <cstring>
-#include <numeric>
 #include <vector>
 
 namespace scan {
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Tuning knobs
+//  Tuning
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int BLOCK_SZ    = 512;   // threads per block
-static constexpr int ITEMS_PT    = 8;     // items per thread (unrolled)
-static constexpr int TILE_SZ     = BLOCK_SZ * ITEMS_PT;  // = 4096 per tile
-
-// Bank-conflict-free shared memory (same trick as v1)
-static constexpr int LOG_BANKS   = 5;
-static constexpr int N_BANKS     = 32;
-#define BCF(n)  ((n) >> LOG_BANKS)
+static constexpr int BLOCK_SZ = 256;
+static constexpr int ITEMS_PT = 8;
+static constexpr int TILE_SZ  = BLOCK_SZ * ITEMS_PT;  // 2048 per tile
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Status flags for decoupled look-back
+//  Status flags packed into a 64-bit atomic word
+//  upper 32 bits = value,  lower 32 bits = flag
 // ─────────────────────────────────────────────────────────────────────────────
-// Stored as 64-bit: upper 32 bits = aggregate/prefix value, lower 32 bits = flag
-// This lets a single 64-bit atomic load read both atomically.
-static constexpr long long STATUS_INVALID = 0LL;
-static constexpr long long STATUS_PARTIAL = 1LL;  // local sum ready
-static constexpr long long STATUS_PREFIX  = 2LL;  // inclusive prefix ready
+static constexpr unsigned long long FLAG_INVALID = 0ULL;
+static constexpr unsigned long long FLAG_PARTIAL = 1ULL;
+static constexpr unsigned long long FLAG_PREFIX  = 2ULL;
 
-// Pack value + flag into a single 64-bit word for atomic reads
-__device__ __forceinline__ long long pack(value_t val, long long flag) {
-    return (static_cast<long long>(static_cast<unsigned int>(val)) << 32) | flag;
+__device__ __forceinline__
+unsigned long long pack(value_t val, unsigned long long flag) {
+    return ((unsigned long long)(unsigned int)val << 32) | flag;
 }
-__device__ __forceinline__ value_t unpack_val(long long p)  { return static_cast<value_t>(static_cast<unsigned int>(p >> 32)); }
-__device__ __forceinline__ long long unpack_flag(long long p) { return p & 0xFFFFFFFFLL; }
+__device__ __forceinline__ value_t        unpack_val (unsigned long long w) { return (value_t)(unsigned int)(w >> 32); }
+__device__ __forceinline__ unsigned long long unpack_flag(unsigned long long w) { return w & 0xFFFFFFFFULL; }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Warp-level inclusive scan using shuffle instructions
-//  (no shared memory, no __syncthreads, O(log 32) latency)
+//  Warp-level inclusive scan (shuffle, no smem, no __syncthreads)
 // ─────────────────────────────────────────────────────────────────────────────
-__device__ __forceinline__ value_t warp_inclusive_scan(value_t val) {
+__device__ __forceinline__ value_t warp_inclusive_scan(value_t v) {
     #pragma unroll
-    for (int offset = 1; offset < 32; offset <<= 1) {
-        value_t n = __shfl_up_sync(0xFFFFFFFF, val, offset);
-        if (threadIdx.x % 32 >= offset) val += n;
+    for (int d = 1; d < 32; d <<= 1) {
+        value_t t = __shfl_up_sync(0xFFFFFFFF, v, d);
+        if ((threadIdx.x & 31) >= d) v += t;
     }
-    return val;
-}
-
-__device__ __forceinline__ value_t warp_exclusive_scan(value_t val) {
-    value_t inc = warp_inclusive_scan(val);
-    return __shfl_up_sync(0xFFFFFFFF, inc, 1) * (int)(threadIdx.x % 32 != 0);
+    return v;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Block-level exclusive scan
-//  Uses warp scans + one round of shared memory for inter-warp communication
+//  smem_warps : shared scratch, size = BLOCK_SZ/32
+//  smem_total : shared scalar set to the block's total sum
+//  Returns exclusive prefix for this thread within the block.
 // ─────────────────────────────────────────────────────────────────────────────
-__device__ value_t block_exclusive_scan(value_t val, value_t* smem_warp_sums) {
+__device__ value_t block_exclusive_scan(
+    value_t  val,
+    value_t* smem_warps,
+    value_t* smem_total
+) {
     const int lane    = threadIdx.x & 31;
     const int warp_id = threadIdx.x >> 5;
-    const int nwarps  = BLOCK_SZ >> 5;   // = 16 for BLOCK_SZ=512
+    const int nwarps  = BLOCK_SZ >> 5;
 
-    // Step 1: inclusive scan within warp
     value_t inc = warp_inclusive_scan(val);
 
-    // Step 2: last lane of each warp writes warp total to smem
-    if (lane == 31) smem_warp_sums[warp_id] = inc;
+    if (lane == 31) smem_warps[warp_id] = inc;
     __syncthreads();
 
-    // Step 3: first warp scans warp totals (nwarps ≤ 32 → fits in one warp)
-    if (warp_id == 0 && lane < nwarps) {
-        smem_warp_sums[lane] = warp_inclusive_scan(smem_warp_sums[lane]);
+    // First warp scans warp totals (nwarps <= 32 for BLOCK_SZ <= 1024)
+    if (warp_id == 0) {
+        value_t wt = (lane < nwarps) ? smem_warps[lane] : 0;
+        wt = warp_inclusive_scan(wt);
+        if (lane < nwarps) smem_warps[lane] = wt;
     }
     __syncthreads();
 
-    // Step 4: convert to exclusive by subtracting original val and adding warp prefix
-    value_t warp_prefix = (warp_id == 0) ? 0 : smem_warp_sums[warp_id - 1];
-    return inc - val + warp_prefix;   // = exclusive position in block
+    if (threadIdx.x == BLOCK_SZ - 1) *smem_total = smem_warps[nwarps - 1];
+
+    value_t warp_prefix = (warp_id == 0) ? 0 : smem_warps[warp_id - 1];
+    return inc - val + warp_prefix;  // exclusive
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
 //  Single-pass decoupled look-back kernel
-//  ONE launch, handles any n, tiles claim work via atomic counter.
 // ─────────────────────────────────────────────────────────────────────────────
-__global__ void single_pass_scan_kernel(
-    const value_t* __restrict__ d_in,
-          value_t* __restrict__ d_out,
-    int                         n,
-    int                         num_tiles,
-    long long* __restrict__     tile_status,   // per-tile status word (packed)
-    int*                        tile_counter,  // global tile index allocator
-    bool                        inclusive
+__global__ void single_pass_kernel(
+    const value_t* __restrict__      d_in,
+          value_t* __restrict__      d_out,
+    int                              n,
+    unsigned long long* __restrict__ tile_status,
+    int*                             tile_counter,
+    bool                             inclusive
 ) {
-    // ── shared memory layout ───────────────────────────────────────────────
-    __shared__ value_t  smem_items[TILE_SZ + (TILE_SZ >> LOG_BANKS)];  // data
-    __shared__ value_t  smem_warp[BLOCK_SZ >> 5];                       // warp sums
-    __shared__ int      smem_tile_id;                                   // my tile id
-    __shared__ value_t  smem_prefix;                                    // incoming prefix
+    __shared__ value_t smem_warps[BLOCK_SZ / 32];
+    __shared__ value_t smem_block_total;
+    __shared__ value_t smem_prefix;
+    __shared__ int     smem_tile_id;
 
-    // ── claim a tile ───────────────────────────────────────────────────────
+    // ── 1. Claim tile ─────────────────────────────────────────────────────────
     if (threadIdx.x == 0) {
         smem_tile_id = atomicAdd(tile_counter, 1);
         smem_prefix  = 0;
@@ -177,213 +118,195 @@ __global__ void single_pass_scan_kernel(
     const int tile_id = smem_tile_id;
     const int base    = tile_id * TILE_SZ;
 
-    // ── 1. Load ITEMS_PT elements per thread with bounds check ─────────────
+    // ── 2. Load data (strided layout: thread t owns indices base+t, base+t+BLOCK_SZ, ...) ──
     value_t items[ITEMS_PT];
     #pragma unroll
     for (int i = 0; i < ITEMS_PT; ++i) {
-        int idx = base + threadIdx.x * ITEMS_PT + i;
+        int idx = base + threadIdx.x + i * BLOCK_SZ;
         items[i] = (idx < n) ? __ldg(&d_in[idx]) : 0;
     }
 
-    // ── 2. Thread-local prefix sum (serial over ITEMS_PT elements) ─────────
+    // ── 3. Thread-local sum ───────────────────────────────────────────────────
     value_t thread_sum = 0;
     #pragma unroll
     for (int i = 0; i < ITEMS_PT; ++i) thread_sum += items[i];
 
-    // ── 3. Block-level exclusive scan of thread sums ───────────────────────
-    value_t thread_excl = block_exclusive_scan(thread_sum, smem_warp);
-    // thread_excl = exclusive prefix of this thread's chunk within the tile
+    // ── 4. Block scan → smem_block_total holds tile aggregate after __syncthreads ──
+    value_t thread_excl = block_exclusive_scan(thread_sum, smem_warps, &smem_block_total);
+    __syncthreads();  // smem_block_total is now valid
 
-    // ── 4. Tile aggregate = last thread's excl + its sum ──────────────────
-    value_t tile_agg = 0;
-    if (threadIdx.x == BLOCK_SZ - 1) {
-        tile_agg = thread_excl + thread_sum;
-    }
-    // broadcast tile_agg to all threads
-    tile_agg = __shfl_sync(0xFFFFFFFF, tile_agg, BLOCK_SZ - 1,
-                           min(BLOCK_SZ, 32));  // only correct if BLOCK_SZ<=32
-    // For BLOCK_SZ > 32 we need smem:
-    __shared__ value_t smem_tile_agg;
-    if (threadIdx.x == BLOCK_SZ - 1) smem_tile_agg = tile_agg;
-    __syncthreads();
-    tile_agg = smem_tile_agg;
+    value_t tile_agg = smem_block_total;
 
-    // ── 5. Publish partial aggregate; tile 0 immediately publishes prefix ──
+    // ── 5. Publish status ─────────────────────────────────────────────────────
     if (threadIdx.x == 0) {
         if (tile_id == 0) {
-            // Tile 0: no predecessor; exclusive prefix = 0
-            atomicExch((unsigned long long*)&tile_status[tile_id],
-                       (unsigned long long)pack(tile_agg, STATUS_PREFIX));
+            __threadfence();
+            atomicExch((unsigned long long*)&tile_status[0],
+                       pack(tile_agg, FLAG_PREFIX));
             smem_prefix = 0;
         } else {
-            // Publish PARTIAL so predecessors can see our aggregate
+            __threadfence();
             atomicExch((unsigned long long*)&tile_status[tile_id],
-                       (unsigned long long)pack(tile_agg, STATUS_PARTIAL));
+                       pack(tile_agg, FLAG_PARTIAL));
         }
     }
     __syncthreads();
 
-    // ── 6. Look-back: accumulate prefix from predecessor tiles ─────────────
+    // ── 6. Look-back (only thread 0 does this) ────────────────────────────────
     if (tile_id > 0 && threadIdx.x == 0) {
-        value_t running_prefix = 0;
+        value_t running = 0;
         int look = tile_id - 1;
 
         while (look >= 0) {
-            long long status_word;
-            // Spin until this tile has at least PARTIAL status
+            unsigned long long word;
+            // spin until predecessor publishes at least PARTIAL
             do {
-                status_word = atomicAdd((unsigned long long*)&tile_status[look], 0ULL);
-            } while (unpack_flag(status_word) == STATUS_INVALID);
+                word = atomicAdd((unsigned long long*)&tile_status[look], 0ULL);
+            } while (unpack_flag(word) == FLAG_INVALID);
 
-            value_t agg = unpack_val(status_word);
-
-            if (unpack_flag(status_word) == STATUS_PREFIX) {
-                // Found a tile with a complete prefix — we're done
-                running_prefix += agg;
+            value_t agg = unpack_val(word);
+            if (unpack_flag(word) == FLAG_PREFIX) {
+                running += agg;
                 break;
             } else {
-                // PARTIAL: accumulate and keep looking back
-                running_prefix += agg;
+                running += agg;
                 --look;
             }
         }
 
-        smem_prefix = running_prefix;
+        smem_prefix = running;
 
-        // Publish our own inclusive prefix (running_prefix + tile_agg)
+        // Publish own complete prefix
+        __threadfence();
         atomicExch((unsigned long long*)&tile_status[tile_id],
-                   (unsigned long long)pack(running_prefix + tile_agg, STATUS_PREFIX));
+                   pack(running + tile_agg, FLAG_PREFIX));
     }
     __syncthreads();
 
-    // ── 7. Compute per-element output and store ────────────────────────────
-    value_t prefix = smem_prefix + thread_excl;
+    // ── 7. Write output ───────────────────────────────────────────────────────
+    value_t running = smem_prefix + thread_excl;
 
     #pragma unroll
     for (int i = 0; i < ITEMS_PT; ++i) {
-        int idx = base + threadIdx.x * ITEMS_PT + i;
+        int idx = base + threadIdx.x + i * BLOCK_SZ;
         if (idx < n) {
-            // exclusive: prefix accumulated before this item
-            value_t excl_val = prefix;
-            prefix += items[i];
-            d_out[idx] = inclusive ? prefix : excl_val;
+            if (inclusive) {
+                running    += items[i];
+                d_out[idx]  = running;
+            } else {
+                d_out[idx]  = running;
+                running    += items[i];
+            }
         }
     }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  Per-call workspace (allocated once, reused across benchmark repetitions)
+//  Persistent workspace
 // ─────────────────────────────────────────────────────────────────────────────
-struct DeviceWorkspace {
-    long long* tile_status  = nullptr;
-    int*       tile_counter = nullptr;
-    int        capacity     = 0;   // max tiles allocated
+struct Workspace {
+    unsigned long long* status  = nullptr;
+    int*                counter = nullptr;
+    int                 cap     = 0;
 
-    void ensure(int num_tiles) {
-        if (num_tiles <= capacity) return;
-        if (tile_status)  CUDA_CHECK(cudaFree(tile_status));
-        if (tile_counter) CUDA_CHECK(cudaFree(tile_counter));
-        CUDA_CHECK(cudaMalloc(&tile_status,  num_tiles * sizeof(long long)));
-        CUDA_CHECK(cudaMalloc(&tile_counter, sizeof(int)));
-        capacity = num_tiles;
+    void ensure(int tiles) {
+        if (tiles <= cap) return;
+        if (status)  CUDA_CHECK(cudaFree(status));
+        if (counter) CUDA_CHECK(cudaFree(counter));
+        CUDA_CHECK(cudaMalloc(&status,  tiles * sizeof(unsigned long long)));
+        CUDA_CHECK(cudaMalloc(&counter, sizeof(int)));
+        cap = tiles;
     }
-
-    void reset(int num_tiles, cudaStream_t s) {
-        CUDA_CHECK(cudaMemsetAsync(tile_status,  0, num_tiles * sizeof(long long), s));
-        CUDA_CHECK(cudaMemsetAsync(tile_counter, 0, sizeof(int), s));
+    void reset(int tiles, cudaStream_t s) {
+        CUDA_CHECK(cudaMemsetAsync(status,  0, tiles * sizeof(unsigned long long), s));
+        CUDA_CHECK(cudaMemsetAsync(counter, 0, sizeof(int), s));
     }
-
-    ~DeviceWorkspace() {
-        if (tile_status)  cudaFree(tile_status);
-        if (tile_counter) cudaFree(tile_counter);
+    ~Workspace() {
+        if (status)  cudaFree(status);
+        if (counter) cudaFree(counter);
     }
 };
-
-// Global workspace — allocated lazily, freed at process exit
-static DeviceWorkspace g_ws;
+static Workspace g_ws;
 
 // ─────────────────────────────────────────────────────────────────────────────
-//  v1 Blelloch helpers (kept for comparison)
+//  v1 Blelloch recursive (kept for comparison)
 // ─────────────────────────────────────────────────────────────────────────────
-static constexpr int V1_BLOCK = 1024;
-static constexpr int V1_EPB   = 2 * V1_BLOCK;
-static constexpr int V1_SMEM  = V1_EPB + (V1_EPB >> LOG_BANKS);
+static constexpr int V1_BLK  = 1024;
+static constexpr int V1_EPB  = 2 * V1_BLK;
+static constexpr int V1_SMEM = V1_EPB + (V1_EPB >> 5);
 
 __global__ void v1_block_scan(
-    const value_t* __restrict__ d_in,
-          value_t* __restrict__ d_out,
-          value_t* __restrict__ block_sums,
-    int n_padded
-) {
-    extern __shared__ value_t smem[];
-    const int tid  = threadIdx.x;
-    const int base = blockIdx.x * V1_EPB;
-    int ai = tid, bi = tid + V1_BLOCK;
-    int ai_s = ai + BCF(ai), bi_s = bi + BCF(bi);
-    smem[ai_s] = (base+ai < n_padded) ? d_in[base+ai] : 0;
-    smem[bi_s] = (base+bi < n_padded) ? d_in[base+bi] : 0;
+    const value_t* __restrict__ in,
+          value_t* __restrict__ out,
+          value_t* __restrict__ sums, int np)
+{
+    extern __shared__ value_t s[];
+    int tid = threadIdx.x, base = blockIdx.x * V1_EPB;
+    int ai = tid, bi = tid + V1_BLK;
+    int as = ai + (ai >> 5), bs = bi + (bi >> 5);
+    s[as] = (base+ai < np) ? in[base+ai] : 0;
+    s[bs] = (base+bi < np) ? in[base+bi] : 0;
     __syncthreads();
-    int offset = 1;
+    int off = 1;
     for (int d = V1_EPB>>1; d > 0; d >>= 1) {
         __syncthreads();
         if (tid < d) {
-            int a2 = offset*(2*tid+1)-1+BCF(offset*(2*tid+1)-1);
-            int b2 = offset*(2*tid+2)-1+BCF(offset*(2*tid+2)-1);
-            smem[b2] += smem[a2];
+            int a = off*(2*tid+1)-1; a += a>>5;
+            int b = off*(2*tid+2)-1; b += b>>5;
+            s[b] += s[a];
         }
-        offset <<= 1;
+        off <<= 1;
     }
     __syncthreads();
     if (tid == 0) {
-        int root = V1_EPB-1+BCF(V1_EPB-1);
-        block_sums[blockIdx.x] = smem[root];
-        smem[root] = 0;
+        int r = V1_EPB-1+((V1_EPB-1)>>5);
+        sums[blockIdx.x] = s[r];
+        s[r] = 0;
     }
     __syncthreads();
     for (int d = 1; d < V1_EPB; d <<= 1) {
-        offset >>= 1;
-        __syncthreads();
+        off >>= 1; __syncthreads();
         if (tid < d) {
-            int a2 = offset*(2*tid+1)-1+BCF(offset*(2*tid+1)-1);
-            int b2 = offset*(2*tid+2)-1+BCF(offset*(2*tid+2)-1);
-            value_t t = smem[a2]; smem[a2] = smem[b2]; smem[b2] += t;
+            int a = off*(2*tid+1)-1; a += a>>5;
+            int b = off*(2*tid+2)-1; b += b>>5;
+            value_t t = s[a]; s[a] = s[b]; s[b] += t;
         }
     }
     __syncthreads();
-    if (base+ai < n_padded) d_out[base+ai] = smem[ai_s];
-    if (base+bi < n_padded) d_out[base+bi] = smem[bi_s];
+    if (base+ai < np) out[base+ai] = s[as];
+    if (base+bi < np) out[base+bi] = s[bs];
 }
 
-__global__ void v1_add_offsets(value_t* d_inout, const value_t* offsets, int n_padded) {
-    int idx = blockIdx.x * V1_EPB + threadIdx.x;
-    value_t off = offsets[blockIdx.x];
-    if (idx              < n_padded) d_inout[idx]           += off;
-    if (idx + V1_BLOCK   < n_padded) d_inout[idx + V1_BLOCK] += off;
+__global__ void v1_add(value_t* io, const value_t* off, int np) {
+    int i = blockIdx.x * V1_EPB + threadIdx.x;
+    value_t o = off[blockIdx.x];
+    if (i          < np) io[i]          += o;
+    if (i + V1_BLK < np) io[i + V1_BLK] += o;
 }
 
-__global__ void v1_to_inclusive(const value_t* excl, const value_t* in, value_t* out, int n) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx < n) out[idx] = excl[idx] + in[idx];
+__global__ void v1_incl(const value_t* ex, const value_t* in, value_t* out, int n) {
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) out[i] = ex[i] + in[i];
 }
 
-static void v1_recursive(const value_t* d_in, value_t* d_out, int n_padded, cudaStream_t s) {
-    int nblocks = n_padded / V1_EPB;
-    value_t* d_bs;
-    CUDA_CHECK(cudaMallocAsync(&d_bs, nblocks * sizeof(value_t), s));
-    v1_block_scan<<<nblocks, V1_BLOCK, V1_SMEM*sizeof(value_t), s>>>(d_in, d_out, d_bs, n_padded);
-    if (nblocks > 1) {
-        int bs_pad = ((nblocks+V1_EPB-1)/V1_EPB)*V1_EPB;
-        value_t *d_bsp, *d_bss;
-        CUDA_CHECK(cudaMallocAsync(&d_bsp, bs_pad*sizeof(value_t), s));
-        CUDA_CHECK(cudaMemsetAsync(d_bsp, 0, bs_pad*sizeof(value_t), s));
-        CUDA_CHECK(cudaMemcpyAsync(d_bsp, d_bs, nblocks*sizeof(value_t), cudaMemcpyDeviceToDevice, s));
-        CUDA_CHECK(cudaMallocAsync(&d_bss, bs_pad*sizeof(value_t), s));
-        v1_recursive(d_bsp, d_bss, bs_pad, s);
-        v1_add_offsets<<<nblocks, V1_BLOCK, 0, s>>>(d_out, d_bss, n_padded);
-        CUDA_CHECK(cudaFreeAsync(d_bsp, s));
-        CUDA_CHECK(cudaFreeAsync(d_bss, s));
+static void v1_recurse(const value_t* di, value_t* dout, int np, cudaStream_t s) {
+    int nb = np / V1_EPB;
+    value_t* ds;
+    CUDA_CHECK(cudaMallocAsync(&ds, nb*sizeof(value_t), s));
+    v1_block_scan<<<nb, V1_BLK, V1_SMEM*sizeof(value_t), s>>>(di, dout, ds, np);
+    if (nb > 1) {
+        int bsp = ((nb + V1_EPB-1)/V1_EPB)*V1_EPB;
+        value_t *dp, *dc;
+        CUDA_CHECK(cudaMallocAsync(&dp, bsp*sizeof(value_t), s));
+        CUDA_CHECK(cudaMemsetAsync(dp, 0, bsp*sizeof(value_t), s));
+        CUDA_CHECK(cudaMemcpyAsync(dp, ds, nb*sizeof(value_t), cudaMemcpyDeviceToDevice, s));
+        CUDA_CHECK(cudaMallocAsync(&dc, bsp*sizeof(value_t), s));
+        v1_recurse(dp, dc, bsp, s);
+        v1_add<<<nb, V1_BLK, 0, s>>>(dout, dc, np);
+        CUDA_CHECK(cudaFreeAsync(dp, s));
+        CUDA_CHECK(cudaFreeAsync(dc, s));
     }
-    CUDA_CHECK(cudaFreeAsync(d_bs, s));
+    CUDA_CHECK(cudaFreeAsync(ds, s));
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -392,10 +315,10 @@ static void v1_recursive(const value_t* d_in, value_t* d_out, int n_padded, cuda
 void gpu_scan(
     const std::vector<value_t>& input,
     std::vector<value_t>&       output,
-    ScanType  scan_type,
+    ScanType  st,
     Algorithm algo
 ) {
-    const int n = static_cast<int>(input.size());
+    const int n = (int)input.size();
     output.resize(n);
     if (n == 0) return;
 
@@ -403,113 +326,88 @@ void gpu_scan(
     CUDA_CHECK(cudaStreamCreate(&stream));
 
     if (algo == Algorithm::CUB) {
-        // ── CUB reference ──────────────────────────────────────────────────
-        value_t *d_in, *d_out;
-        CUDA_CHECK(cudaMallocAsync(&d_in,  n * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMallocAsync(&d_out, n * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_in, input.data(), n*sizeof(value_t),
+        value_t *di, *dout;
+        CUDA_CHECK(cudaMallocAsync(&di,   n*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&dout, n*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMemcpyAsync(di, input.data(), n*sizeof(value_t),
                                    cudaMemcpyHostToDevice, stream));
-        void* d_tmp = nullptr; size_t tmp_bytes = 0;
-        if (scan_type == ScanType::Exclusive) {
-            cub::DeviceScan::ExclusiveSum(d_tmp, tmp_bytes, d_in, d_out, n, stream);
-            CUDA_CHECK(cudaMallocAsync(&d_tmp, tmp_bytes, stream));
-            cub::DeviceScan::ExclusiveSum(d_tmp, tmp_bytes, d_in, d_out, n, stream);
+        void* tmp = nullptr; size_t tb = 0;
+        if (st == ScanType::Exclusive) {
+            cub::DeviceScan::ExclusiveSum(tmp, tb, di, dout, n, stream);
+            CUDA_CHECK(cudaMallocAsync(&tmp, tb, stream));
+            cub::DeviceScan::ExclusiveSum(tmp, tb, di, dout, n, stream);
         } else {
-            cub::DeviceScan::InclusiveSum(d_tmp, tmp_bytes, d_in, d_out, n, stream);
-            CUDA_CHECK(cudaMallocAsync(&d_tmp, tmp_bytes, stream));
-            cub::DeviceScan::InclusiveSum(d_tmp, tmp_bytes, d_in, d_out, n, stream);
+            cub::DeviceScan::InclusiveSum(tmp, tb, di, dout, n, stream);
+            CUDA_CHECK(cudaMallocAsync(&tmp, tb, stream));
+            cub::DeviceScan::InclusiveSum(tmp, tb, di, dout, n, stream);
         }
-        CUDA_CHECK(cudaMemcpyAsync(output.data(), d_out, n*sizeof(value_t),
+        CUDA_CHECK(cudaMemcpyAsync(output.data(), dout, n*sizeof(value_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaFreeAsync(d_in,  stream));
-        CUDA_CHECK(cudaFreeAsync(d_out, stream));
-        if (d_tmp) CUDA_CHECK(cudaFreeAsync(d_tmp, stream));
+        CUDA_CHECK(cudaFreeAsync(di,  stream));
+        CUDA_CHECK(cudaFreeAsync(dout, stream));
+        if (tmp) CUDA_CHECK(cudaFreeAsync(tmp, stream));
 
     } else if (algo == Algorithm::Blelloch) {
-        // ── v1 recursive Blelloch ──────────────────────────────────────────
-        const int n_padded = ((n + V1_EPB - 1) / V1_EPB) * V1_EPB;
-        value_t *d_in, *d_out;
-        CUDA_CHECK(cudaMallocAsync(&d_in,  n_padded * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMallocAsync(&d_out, n_padded * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMemsetAsync(d_in, 0, n_padded * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_in, input.data(), n*sizeof(value_t),
+        int np = ((n + V1_EPB-1)/V1_EPB)*V1_EPB;
+        value_t *di, *dout;
+        CUDA_CHECK(cudaMallocAsync(&di,   np*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&dout, np*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMemsetAsync(di, 0, np*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMemcpyAsync(di, input.data(), n*sizeof(value_t),
                                    cudaMemcpyHostToDevice, stream));
-        v1_recursive(d_in, d_out, n_padded, stream);
-        if (scan_type == ScanType::Inclusive) {
-            int grid = (n + V1_BLOCK - 1) / V1_BLOCK;
-            v1_to_inclusive<<<grid, V1_BLOCK, 0, stream>>>(d_out, d_in, d_out, n);
+        v1_recurse(di, dout, np, stream);
+        if (st == ScanType::Inclusive) {
+            int g = (n + V1_BLK-1)/V1_BLK;
+            v1_incl<<<g, V1_BLK, 0, stream>>>(dout, di, dout, n);
         }
-        CUDA_CHECK(cudaMemcpyAsync(output.data(), d_out, n*sizeof(value_t),
+        CUDA_CHECK(cudaMemcpyAsync(output.data(), dout, n*sizeof(value_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaFreeAsync(d_in,  stream));
-        CUDA_CHECK(cudaFreeAsync(d_out, stream));
+        CUDA_CHECK(cudaFreeAsync(di,  stream));
+        CUDA_CHECK(cudaFreeAsync(dout, stream));
 
     } else {
-        // ── single-pass decoupled look-back (the optimised path) ───────────
-        const int num_tiles = (n + TILE_SZ - 1) / TILE_SZ;
-
-        // Reuse workspace (no per-call cudaMalloc for status/counter)
+        // ── single-pass look-back ──────────────────────────────────────────
+        int num_tiles = (n + TILE_SZ - 1) / TILE_SZ;
         g_ws.ensure(num_tiles);
         g_ws.reset(num_tiles, stream);
 
-        value_t *d_in, *d_out;
-        CUDA_CHECK(cudaMallocAsync(&d_in,  n * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMallocAsync(&d_out, n * sizeof(value_t), stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_in, input.data(), n*sizeof(value_t),
+        value_t *di, *dout;
+        CUDA_CHECK(cudaMallocAsync(&di,   n*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&dout, n*sizeof(value_t), stream));
+        CUDA_CHECK(cudaMemcpyAsync(di, input.data(), n*sizeof(value_t),
                                    cudaMemcpyHostToDevice, stream));
 
-        // ONE kernel launch — persistent grid, tiles self-schedule via counter
-        single_pass_scan_kernel<<<num_tiles, BLOCK_SZ, 0, stream>>>(
-            d_in, d_out, n, num_tiles,
-            g_ws.tile_status, g_ws.tile_counter,
-            (scan_type == ScanType::Inclusive)
+        single_pass_kernel<<<num_tiles, BLOCK_SZ, 0, stream>>>(
+            di, dout, n,
+            g_ws.status, g_ws.counter,
+            (st == ScanType::Inclusive)
         );
 
-        CUDA_CHECK(cudaMemcpyAsync(output.data(), d_out, n*sizeof(value_t),
+        CUDA_CHECK(cudaMemcpyAsync(output.data(), dout, n*sizeof(value_t),
                                    cudaMemcpyDeviceToHost, stream));
         CUDA_CHECK(cudaStreamSynchronize(stream));
-        CUDA_CHECK(cudaFreeAsync(d_in,  stream));
-        CUDA_CHECK(cudaFreeAsync(d_out, stream));
+        CUDA_CHECK(cudaFreeAsync(di,  stream));
+        CUDA_CHECK(cudaFreeAsync(dout, stream));
     }
 
     CUDA_CHECK(cudaStreamDestroy(stream));
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  CPU reference and verify
-// ─────────────────────────────────────────────────────────────────────────────
-void cpu_scan(
-    const std::vector<value_t>& input,
-    std::vector<value_t>&       output,
-    ScanType scan_type
-) {
-    const int n = static_cast<int>(input.size());
-    output.resize(n);
-    value_t running = 0;
-    if (scan_type == ScanType::Exclusive) {
-        for (int i = 0; i < n; ++i) { output[i] = running; running += input[i]; }
-    } else {
-        for (int i = 0; i < n; ++i) { running += input[i]; output[i] = running; }
-    }
+void cpu_scan(const std::vector<value_t>& in, std::vector<value_t>& out, ScanType st) {
+    int n = (int)in.size(); out.resize(n);
+    value_t r = 0;
+    if (st == ScanType::Exclusive)
+        for (int i = 0; i < n; ++i) { out[i] = r; r += in[i]; }
+    else
+        for (int i = 0; i < n; ++i) { r += in[i]; out[i] = r; }
 }
 
-bool verify(
-    const std::vector<value_t>& expected,
-    const std::vector<value_t>& actual,
-    std::size_t* mismatch_idx
-) {
-    if (expected.size() != actual.size()) {
-        if (mismatch_idx) *mismatch_idx = std::min(expected.size(), actual.size());
-        return false;
-    }
-    for (std::size_t i = 0; i < expected.size(); ++i) {
-        if (expected[i] != actual[i]) {
-            if (mismatch_idx) *mismatch_idx = i;
-            return false;
-        }
-    }
+bool verify(const std::vector<value_t>& exp, const std::vector<value_t>& act, std::size_t* idx) {
+    if (exp.size() != act.size()) { if (idx) *idx = std::min(exp.size(), act.size()); return false; }
+    for (std::size_t i = 0; i < exp.size(); ++i)
+        if (exp[i] != act[i]) { if (idx) *idx = i; return false; }
     return true;
 }
 
